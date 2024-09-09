@@ -124,25 +124,6 @@ func handleMetrics(c echo.Context) error {
 			fe := f.Device
 			fe3 := frontend.API3{Device: *fe}
 
-			// stat, err := fe.Stat()
-			// if err != nil {
-			// 	slog.Error("error getting frontend state", "adapter", adapterName, "frontend", frontendName, "error", err)
-			// 	continue
-			// }
-
-			// deadline := time.Now().Add(1 * time.Second)
-
-			// var ev frontend.Event
-			// timedout, err := fe3.WaitEvent(&ev, deadline)
-			// if timedout {
-			// 	continue
-			// }
-			// if err != nil {
-			// 	slog.Error("error waiting for frontend event", "adapter", adapterName, "frontend", frontendName, "error", err)
-			// 	continue
-			// }
-			// st := ev.Status()
-
 			st, err := fe3.Status()
 			if err != nil {
 				slog.Error("error getting fe status", "adapter", adapterName, "frontend", frontendName, "error", err)
