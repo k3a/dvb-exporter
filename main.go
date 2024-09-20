@@ -122,6 +122,72 @@ func handleMetrics(c echo.Context) error {
 			labels["frontend"] = strconv.Itoa(f.ID)
 
 			fe := f.Device
+
+			// v5
+
+			stat, err := fe.Stat()
+			if err != nil {
+				slog.Error("error getting fe status via v5 API", "adapter", adapterName, "frontend", frontendName, "error", err)
+			} else {
+				if len(stat.CNR) > 0 {
+					p := stat.CNR[0]
+					if p.Scale() == frontend.ScaleDecibel {
+						writeGauge(resp.Writer, "dvb_fe_snr", p.Decibel(), "Indicates the Signal to Noise ratio for the main carrier", mkPairs(labels))
+					}
+				}
+
+				if len(stat.Signal) > 0 {
+					p := stat.Signal[0]
+					if p.Scale() == frontend.ScaleDecibel {
+						writeGauge(resp.Writer, "dvb_fe_signal_strength_decibels", p.Decibel(), "Signal strength level at the analog part of the tuner or of the demodd", mkPairs(labels))
+					}
+				}
+
+				if len(stat.PreErrBit) > 0 {
+					p := stat.PreErrBit[0]
+					if p.Scale() == frontend.ScaleCounter {
+						writeCounter(resp.Writer, "dvb_fe_pre_error_bit_count", p.Counter(), "Number of bit errors before the forward error correction (FEC) on the inner coding block (before Viterbi, LDPC or other inner code). Should be divided by _total_bit_counts.", mkPairs(labels))
+					}
+				}
+
+				if len(stat.PreTotBit) > 0 {
+					p := stat.PreTotBit[0]
+					if p.Scale() == frontend.ScaleCounter {
+						writeCounter(resp.Writer, "dvb_fe_pre_total_bit_count", p.Counter(), "Amount of bits received before the inner code block, during the same period as _error_bit_count", mkPairs(labels))
+					}
+				}
+
+				if len(stat.PostErrBit) > 0 {
+					p := stat.PostErrBit[0]
+					if p.Scale() == frontend.ScaleCounter {
+						writeCounter(resp.Writer, "dvb_fe_post_error_bit_count", p.Counter(), "Number of bit errors after the forward error correction (FEC) done by inner code block (after Viterbi, LDPC or other inner code). Should be divided by _total_bit_counts.", mkPairs(labels))
+					}
+				}
+
+				if len(stat.PostTotBit) > 0 {
+					p := stat.PostTotBit[0]
+					if p.Scale() == frontend.ScaleCounter {
+						writeCounter(resp.Writer, "dvb_fe_post_total_bit_count", p.Counter(), "Amount of bits received after the inner coding, during the same period as _error_bit_count", mkPairs(labels))
+					}
+				}
+
+				if len(stat.ErrBlk) > 0 {
+					p := stat.ErrBlk[0]
+					if p.Scale() == frontend.ScaleCounter {
+						writeCounter(resp.Writer, "dvb_fe_error_block_count", p.Counter(), "Number of block errors after the outer forward error correction coding (after Reed-Solomon or other outer code).", mkPairs(labels))
+					}
+				}
+
+				if len(stat.TotBlk) > 0 {
+					p := stat.TotBlk[0]
+					if p.Scale() == frontend.ScaleCounter {
+						writeCounter(resp.Writer, "dvb_fe_total_block_count", p.Counter(), "Total number of blocks received during the same period as _error_block_count", mkPairs(labels))
+					}
+				}
+			}
+
+			// v3
+
 			fe3 := frontend.API3{Device: *fe}
 
 			st, err := fe3.Status()
@@ -157,7 +223,6 @@ func handleMetrics(c echo.Context) error {
 			if err == nil {
 				writeCounter(resp.Writer, "dvb_fe_uncorrected_blocks_total", ub, "Number of uncorrected blocks detected by the device driver during its lifetime", mkPairs(labels))
 			}
-
 		}
 	}
 
