@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"unsafe"
 
@@ -92,9 +93,16 @@ func writeSingle(wr io.Writer, typeStr string, name string, val interface{}, hel
 }
 
 func mkPairs(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+
+	slices.Sort(keys)
+
 	var arr []string
-	for k, v := range m {
-		arr = append(arr, k, v)
+	for _, k := range keys {
+		arr = append(arr, k, m[k])
 	}
 	return arr
 }
