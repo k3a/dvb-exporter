@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
+	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/labstack/echo/v4"
@@ -20,17 +23,19 @@ import (
 var (
 	basePath = flag.String("devpath", "/dev/dvb", "Base path to dvb adapters")
 	listen   = flag.String("listen", ":8027", "Listen bind in format [host]:port")
+
+	adaptersMu sync.RWMutex
 )
 
 type frontendEntry struct {
 	ID     int
-	Name   string
+	Path   string
 	Device *frontend.Device
 }
 
 type adapterEntry struct {
 	ID        int
-	Name      string
+	Path      string
 	Frontends map[string]*frontendEntry
 }
 
@@ -42,20 +47,130 @@ func formatLabels(labelPairs []string) string {
 		return ""
 	}
 
-	str := "{"
-	for i, it := range labelPairs {
-		if i%2 == 0 {
-			if i > 0 {
-				str += `,`
-			}
-			str += it + `="`
-		} else {
-			str += it + `"`
+	var sb strings.Builder
+	sb.WriteString("{")
+
+	for i := 0; i < l; i += 2 {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		sb.WriteString(labelPairs[i])
+		sb.WriteString(`="`)
+		sb.WriteString(labelPairs[i+1])
+		sb.WriteString(`"`)
+	}
+
+	sb.WriteString("}")
+	return sb.String()
+}
+
+func closeFrontend(f *frontendEntry) {
+	if f.Device != nil {
+		f.Device.Close()
+	}
+}
+
+func closeAllAdapters() {
+	for _, a := range adapters {
+		for _, f := range a.Frontends {
+			closeFrontend(f)
 		}
 	}
-	str += "}"
+	adapters = make(map[string]*adapterEntry)
+}
 
-	return str
+func buildAdapters() error {
+	closeAllAdapters()
+
+	adapterPaths, err := filepath.Glob(filepath.Join(*basePath, "adapter*"))
+	if err != nil {
+		return fmt.Errorf("error finding adapters: %v", err)
+	}
+
+	for _, adapterPath := range adapterPaths {
+		adapterNumStr := filepath.Base(adapterPath)[7:]
+		adapterNum, err := strconv.Atoi(adapterNumStr)
+		if err != nil {
+			slog.Warn("Invalid adapter number", "path", adapterPath, "error", err)
+			continue
+		}
+
+		frontendPaths, err := filepath.Glob(filepath.Join(adapterPath, "frontend*"))
+		if err != nil {
+			slog.Warn("Error finding frontends", "adapter", adapterPath, "error", err)
+			continue
+		}
+
+		slog.Info("Found adapter", "adapter", adapterNum, "path", adapterPath)
+
+		a := &adapterEntry{
+			ID:        adapterNum,
+			Path:      adapterPath,
+			Frontends: make(map[string]*frontendEntry),
+		}
+
+		for _, frontendPath := range frontendPaths {
+			frontendNumStr := filepath.Base(frontendPath)[8:]
+			frontendNum, err := strconv.Atoi(frontendNumStr)
+			if err != nil {
+				slog.Warn("Invalid frontend number", "path", frontendPath, "error", err)
+				continue
+			}
+
+			fdev, err := frontend.OpenRO(frontendPath)
+			if err != nil {
+				slog.Warn("Error opening frontend", "path", frontendPath, "error", err)
+				continue
+			}
+
+			slog.Info("Found frontend", "adapter", adapterNum, "frontend", frontendNum, "path", frontendPath)
+
+			f := &frontendEntry{
+				ID:     frontendNum,
+				Path:   frontendPath,
+				Device: &fdev,
+			}
+			a.Frontends[frontendPath] = f
+		}
+
+		adapters[adapterPath] = a
+	}
+
+	return nil
+}
+
+func scanForAdapterChanges() {
+	adapterPaths, err := filepath.Glob(filepath.Join(*basePath, "adapter*"))
+	if err != nil {
+		slog.Error("Error finding adapters during scan", "error", err)
+		return
+	}
+
+	currentAdapters := make(map[string]bool)
+	for _, path := range adapterPaths {
+		currentAdapters[path] = true
+	}
+
+	adaptersMu.Lock()
+	shouldRebuild := len(currentAdapters) != len(adapters)
+
+	if !shouldRebuild {
+		for path := range currentAdapters {
+			if _, exists := adapters[path]; !exists {
+				shouldRebuild = true
+				break
+			}
+		}
+	}
+	adaptersMu.Unlock()
+
+	if shouldRebuild {
+		slog.Info("Adapter changes detected, rebuilding adapters")
+		adaptersMu.Lock()
+		buildAdapters()
+		adaptersMu.Unlock()
+		slog.Info("Adapter rebuild complete")
+	}
 }
 
 func valToString(value interface{}) (string, error) {
@@ -81,7 +196,6 @@ func writeSingle(wr io.Writer, typeStr string, name string, val interface{}, hel
 	}
 	header += "# TYPE " + name + " " + typeStr + "\n"
 
-	// format bool as int
 	valStr, err := valToString(val)
 	if err != nil {
 		return err
@@ -122,6 +236,7 @@ func handleMetrics(c echo.Context) error {
 
 	labels := make(map[string]string)
 
+	adaptersMu.RLock()
 	for adapterName, a := range adapters {
 		for frontendName, f := range a.Frontends {
 			clear(labels)
@@ -132,7 +247,6 @@ func handleMetrics(c echo.Context) error {
 			fe := f.Device
 
 			// v5
-
 			stat, err := fe.Stat()
 			if err != nil {
 				slog.Error("error getting fe status via v5 API", "adapter", adapterName, "frontend", frontendName, "error", err)
@@ -195,7 +309,6 @@ func handleMetrics(c echo.Context) error {
 			}
 
 			// v3
-
 			fe3 := frontend.API3{Device: *fe}
 
 			st, err := fe3.Status()
@@ -204,7 +317,7 @@ func handleMetrics(c echo.Context) error {
 				continue
 			}
 
-			writeGauge(resp.Writer, "dvb_fe_has_signal", st&frontend.HasSignal > 0, "Frontend found something above the noise levell", mkPairs(labels))
+			writeGauge(resp.Writer, "dvb_fe_has_signal", st&frontend.HasSignal > 0, "Frontend found something above the noise level", mkPairs(labels))
 			writeGauge(resp.Writer, "dvb_fe_has_carrier", st&frontend.HasCarrier > 0, "Frontend found a DVB signal", mkPairs(labels))
 			writeGauge(resp.Writer, "dvb_fe_has_viterbi", st&frontend.HasViterbi > 0, "FEC is stable", mkPairs(labels))
 			writeGauge(resp.Writer, "dvb_fe_has_sync", st&frontend.HasSync > 0, "Frontend found sync bytes", mkPairs(labels))
@@ -233,6 +346,7 @@ func handleMetrics(c echo.Context) error {
 			}
 		}
 	}
+	adaptersMu.RUnlock()
 
 	return nil
 }
@@ -246,69 +360,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Walk through the base path to find adapters
-	adapterPaths, err := filepath.Glob(filepath.Join(*basePath, "adapter*"))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error finding adapters: %v\n", err)
-		return
+	// Initial build of adapters
+	if err := buildAdapters(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error building initial adapters: %v\n", err)
+		os.Exit(1)
 	}
 
-	for _, adapterName := range adapterPaths {
-		// Extract adapter number
-		adapterNumStr := filepath.Base(adapterName)[7:] // "adapter" is 7 characters long
-		adapterNum, err := strconv.Atoi(adapterNumStr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid adapter number: %s\n", adapterNumStr)
-			continue
+	// Start background job to scan for adapter changes every minute
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			scanForAdapterChanges()
 		}
-
-		// Walk through each adapter to find frontends
-		frontendPaths, err := filepath.Glob(filepath.Join(adapterName, "frontend*"))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error finding frontends in %s: %v\n", adapterName, err)
-			continue
-		}
-
-		for _, frontendName := range frontendPaths {
-			// Extract frontend number
-			frontendNumStr := filepath.Base(frontendName)[8:] // "frontend" is 8 characters long
-			frontendNum, err := strconv.Atoi(frontendNumStr)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Invalid frontend number: %s\n", frontendNumStr)
-				continue
-			}
-
-			// Process the frontend
-			slog.Info("Found a device", "adapter", adapterNum, "frontend", frontendNum)
-
-			fpath := filepath.Join(*basePath, "adapter"+strconv.Itoa(adapterNum), "frontend"+strconv.Itoa(frontendNum))
-			fdev, err := frontend.OpenRO(fpath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error opening frontend %s: %v\n", fpath, err)
-				os.Exit(2)
-			}
-
-			a := adapters[adapterName]
-			if a == nil {
-				a = &adapterEntry{
-					ID:        adapterNum,
-					Name:      adapterName,
-					Frontends: make(map[string]*frontendEntry),
-				}
-				adapters[adapterName] = a
-			}
-
-			f := a.Frontends[frontendName]
-			if f == nil {
-				f = &frontendEntry{
-					ID:     frontendNum,
-					Name:   frontendName,
-					Device: &fdev,
-				}
-				a.Frontends[frontendName] = f
-			}
-		}
-	}
+	}()
 
 	e := echo.New()
 	e.HideBanner = true
@@ -317,5 +383,5 @@ func main() {
 	e.GET("/metrics", handleMetrics)
 	e.GET("/", func(c echo.Context) error { return c.Redirect(http.StatusTemporaryRedirect, "/metrics") })
 
-	fmt.Fprintf(os.Stderr, "Error listening: %v", e.Start(*listen))
+	fmt.Fprintf(os.Stderr, "Error listening: %v\n", e.Start(*listen))
 }
